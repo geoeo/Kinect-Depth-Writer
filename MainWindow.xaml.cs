@@ -61,6 +61,12 @@ namespace Microsoft.Samples.Kinect.DepthBasics
         /// </summary>
         private string statusText = null;
 
+        // Frame Reader for synced depth and color. Apparenty there is a 6.25 millisecond lag
+        private MultiSourceFrameReader multiSourceFrameReader;
+        private FrameDescription colorFrameDescription;
+        private byte[] colorPixels;
+        private WriteableBitmap colorBitmap;
+
         /// <summary>
         /// Initializes a new instance of the MainWindow class.
         /// </summary>
@@ -72,20 +78,31 @@ namespace Microsoft.Samples.Kinect.DepthBasics
             // open the reader for the depth frames
             this.depthFrameReader = this.kinectSensor.DepthFrameSource.OpenReader();
 
+            this.multiSourceFrameReader = this.kinectSensor.OpenMultiSourceFrameReader(FrameSourceTypes.Color | FrameSourceTypes.Depth);
+
             // wire handler for frame arrival
             this.depthFrameReader.FrameArrived += this.Reader_FrameArrived;
+
+            this.multiSourceFrameReader.MultiSourceFrameArrived += this.MultiReader_FrameArrived;
 
             // get FrameDescription from DepthFrameSource
             this.depthFrameDescription = this.kinectSensor.DepthFrameSource.FrameDescription;
 
+            this.colorFrameDescription = this.kinectSensor.ColorFrameSource.CreateFrameDescription(ColorImageFormat.Bgra);
+
             // allocate space to put the pixels being received and converted
             this.depthPixels = new byte[this.depthFrameDescription.Width * this.depthFrameDescription.Height];
+
+            this.colorPixels = new byte[this.colorFrameDescription.Width * this.colorFrameDescription.Height];
 
             // allocate space to put the kinect values used to write to disk
             this.rawDepth = new ushort[this.depthFrameDescription.Width * this.depthFrameDescription.Height];
 
             // create the bitmap to display
             this.depthBitmap = new WriteableBitmap(this.depthFrameDescription.Width, this.depthFrameDescription.Height, 96.0, 96.0, PixelFormats.Gray8, null);
+
+
+            this.colorBitmap = new WriteableBitmap(this.colorFrameDescription.Width, this.colorFrameDescription.Height, 96.0, 96.0, PixelFormats.Bgra32, null);
 
             // set IsAvailableChanged event notifier
             this.kinectSensor.IsAvailableChanged += this.Sensor_IsAvailableChanged;
@@ -104,6 +121,102 @@ namespace Microsoft.Samples.Kinect.DepthBasics
             this.InitializeComponent();
         }
 
+        private void MultiReader_FrameArrived(object sender, MultiSourceFrameArrivedEventArgs e)
+        {
+            bool depthFrameProcessed = false;
+            bool colorFrameProcessed = false;
+
+            DepthFrame depthFrame = null;
+            ColorFrame colorFrame = null;
+
+            MultiSourceFrame multiSourceFrame = e.FrameReference.AcquireFrame();
+
+            // If the Frame has expired by the time we process this event, return.
+            if (multiSourceFrame == null)
+            {
+                return;
+            }
+
+            // We use a try/finally to ensure that we clean up before we exit the function.  
+            // This includes calling Dispose on any Frame objects that we may have and unlocking the bitmap back buffer.
+            try
+            {
+                depthFrame = multiSourceFrame.DepthFrameReference.AcquireFrame();
+                colorFrame = multiSourceFrame.ColorFrameReference.AcquireFrame();
+
+                // If any frame has expired by the time we process this event, return.
+                // The "finally" statement will Dispose any that are not null.
+                if ((depthFrame == null) || (colorFrame == null))
+                {
+                    return;
+                }
+
+                using (Microsoft.Kinect.KinectBuffer depthBuffer = depthFrame.LockImageBuffer())
+                {
+                    // verify data and write the color data to the display bitmap
+                    if (((this.depthFrameDescription.Width * this.depthFrameDescription.Height) == (depthBuffer.Size / this.depthFrameDescription.BytesPerPixel)) &&
+                        (this.depthFrameDescription.Width == this.depthBitmap.PixelWidth) && (this.depthFrameDescription.Height == this.depthBitmap.PixelHeight))
+                    {
+                        // Note: In order to see the full range of depth (including the less reliable far field depth)
+                        // we are setting maxDepth to the extreme potential depth threshold
+                        ushort maxDepth = ushort.MaxValue;
+                        //ushort maxDepth = 8000;
+
+                        // If you wish to filter by reliable depth distance, uncomment the following line:
+                        //// maxDepth = depthFrame.DepthMaxReliableDistance
+
+                        this.ProcessDepthFrameData(depthBuffer.UnderlyingBuffer, depthBuffer.Size, depthFrame.DepthMinReliableDistance, maxDepth);
+                        depthFrameProcessed = true;
+                    }
+                }
+
+
+                using (Microsoft.Kinect.KinectBuffer colorBuffer = colorFrame.LockRawImageBuffer())
+                {
+                    this.colorBitmap.Lock();
+
+                    // verify data and write the new color frame data to the display bitmap
+                    if ((colorFrameDescription.Width == this.colorBitmap.PixelWidth) && (colorFrameDescription.Height == this.colorBitmap.PixelHeight))
+                    {
+                        colorFrame.CopyConvertedFrameDataToIntPtr(
+                            this.colorBitmap.BackBuffer,
+                            (uint)(colorFrameDescription.Width * colorFrameDescription.Height * 4),
+                            ColorImageFormat.Bgra);
+
+                        this.colorBitmap.AddDirtyRect(new Int32Rect(0, 0, this.colorBitmap.PixelWidth, this.colorBitmap.PixelHeight));
+                    }
+
+                    this.colorBitmap.Unlock();
+                }
+            }
+
+            finally
+            {
+
+                if (depthFrame != null)
+                {
+                    depthFrame.Dispose();
+                }
+
+                if (colorFrame != null)
+                {
+                    colorFrame.Dispose();
+                }
+
+                if (depthFrameProcessed)
+                {
+                   // this.RenderDepthPixels();
+                }
+
+            }
+
+        }
+
+        private void ProcessColorFrameData(IntPtr underlyingBuffer, uint size)
+        {
+            throw new NotImplementedException();
+        }
+
         /// <summary>
         /// INotifyPropertyChangedPropertyChanged event to allow window controls to bind to changeable data
         /// </summary>
@@ -116,7 +229,7 @@ namespace Microsoft.Samples.Kinect.DepthBasics
         {
             get
             {
-                return this.depthBitmap;
+                return this.colorBitmap;
             }
         }
 
@@ -159,6 +272,13 @@ namespace Microsoft.Samples.Kinect.DepthBasics
                 this.depthFrameReader = null;
             }
 
+            if (this.multiSourceFrameReader != null)
+            {
+                // DepthFrameReader is IDisposable
+                this.multiSourceFrameReader.Dispose();
+                this.multiSourceFrameReader = null;
+            }
+
             if (this.kinectSensor != null)
             {
                 this.kinectSensor.Close();
@@ -173,6 +293,19 @@ namespace Microsoft.Samples.Kinect.DepthBasics
         /// <param name="e">event arguments</param>
         private void ScreenshotButton_Click(object sender, RoutedEventArgs e)
         {
+
+            string time = System.DateTime.UtcNow.ToString("hh'-'mm'-'ss", CultureInfo.CurrentUICulture.DateTimeFormat);
+
+            string myPhotos = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+            string myDocuments = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+
+            string folderPath = Path.Combine(myDocuments, time);
+            string depthScreenshotPath = Path.Combine(folderPath, "depthScreenshot.png");
+            string colorScreenshotPath = Path.Combine(folderPath, "colorScreenshot.png");
+            string rawDataPath = Path.Combine(folderPath, "raw-ushort-512-424.txt");
+
+            Directory.CreateDirectory(folderPath);
+
             if (this.depthBitmap != null)
             {
                 // create a png bitmap encoder which knows how to save a .png file
@@ -181,31 +314,20 @@ namespace Microsoft.Samples.Kinect.DepthBasics
                 // create frame from the writable bitmap and add to encoder
                 encoder.Frames.Add(BitmapFrame.Create(this.depthBitmap));
 
-                string time = System.DateTime.UtcNow.ToString("hh'-'mm'-'ss", CultureInfo.CurrentUICulture.DateTimeFormat);
-
-                string myPhotos = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
-                string myDocuments = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-
-                string folderPath = Path.Combine(myDocuments, time);
-                string screenshotPath = Path.Combine(folderPath, "Screenshot.png");
-                string rawDataPath = Path.Combine(folderPath,"raw-ushort-512-424.txt");
-
-                Directory.CreateDirectory(folderPath);
-
                 // write the new file to disk
                 try
                 {
                     // FileStream is IDisposable
-                    using (FileStream fs = new FileStream(screenshotPath, FileMode.Create))
+                    using (FileStream fs = new FileStream(depthScreenshotPath, FileMode.Create))
                     {
                         encoder.Save(fs);
                     }
 
-                    this.StatusText = string.Format(CultureInfo.CurrentCulture, Properties.Resources.SavedScreenshotStatusTextFormat, screenshotPath);
+                    this.StatusText = string.Format(CultureInfo.CurrentCulture, Properties.Resources.SavedScreenshotStatusTextFormat, depthScreenshotPath);
                 }
                 catch (IOException)
                 {
-                    this.StatusText = string.Format(CultureInfo.CurrentCulture, Properties.Resources.FailedScreenshotStatusTextFormat, screenshotPath);
+                    this.StatusText = string.Format(CultureInfo.CurrentCulture, Properties.Resources.FailedScreenshotStatusTextFormat, depthScreenshotPath);
                     Directory.Delete(folderPath);
                 }
 
@@ -229,6 +351,35 @@ namespace Microsoft.Samples.Kinect.DepthBasics
                     Directory.Delete(folderPath);
                 }
             }
+
+            if(colorBitmap != null)
+            {
+                // create a png bitmap encoder which knows how to save a .png file
+                BitmapEncoder encoder = new PngBitmapEncoder();
+
+                // create frame from the writable bitmap and add to encoder
+                encoder.Frames.Add(BitmapFrame.Create(this.colorBitmap));
+
+
+                // write the new file to disk
+                try
+                {
+                    // FileStream is IDisposable
+                    using (FileStream fs = new FileStream(colorScreenshotPath, FileMode.Create))
+                    {
+                        encoder.Save(fs);
+                    }
+
+                    this.StatusText = string.Format(Properties.Resources.SavedScreenshotStatusTextFormat, colorScreenshotPath);
+                }
+                catch (IOException)
+                {
+                    this.StatusText = string.Format(Properties.Resources.FailedScreenshotStatusTextFormat, colorScreenshotPath);
+                }
+            }
+
+
+
         }
 
         /// <summary>
@@ -246,6 +397,7 @@ namespace Microsoft.Samples.Kinect.DepthBasics
                 {
                     // the fastest way to process the body index data is to directly access 
                     // the underlying buffer
+
                     using (Microsoft.Kinect.KinectBuffer depthBuffer = depthFrame.LockImageBuffer())
                     {
                         // verify data and write the color data to the display bitmap
